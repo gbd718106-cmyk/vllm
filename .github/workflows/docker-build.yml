@@ -1,0 +1,121 @@
+name: Docker Build & Push
+
+# Builds the RunPod vLLM worker image on GitHub's runners and pushes it to
+# Docker Hub. No local Docker is required.
+#
+# Required repository secrets:
+#   DOCKERHUB_USERNAME  - your Docker Hub username
+#   DOCKERHUB_TOKEN     - Docker Hub access token (Account Settings > Security)
+# Optional:
+#   HUGGINGFACE_ACCESS_TOKEN - only needed when baking a gated model (MODEL_NAME)
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      vllm_version:
+        description: "vLLM base image tag (e.g. v0.32.0)"
+        required: false
+        default: "v0.32.0"
+        type: string
+      image_tag:
+        description: "Docker tag to push (e.g. latest, v0.32.0)"
+        required: false
+        default: "latest"
+        type: string
+      model_name:
+        description: "Optional: bake this HF model into the image"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: worker-v1-vllm
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The vLLM base image is multi-GB; the default runner disk is too small.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf "/usr/local/share/boost"
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VLLM_VERSION="${{ inputs.vllm_version }}"
+            IMAGE_TAG="${{ inputs.image_tag }}"
+            MODEL_NAME="${{ inputs.model_name }}"
+          else
+            VLLM_VERSION="v0.32.0"
+            IMAGE_TAG="latest"
+            MODEL_NAME=""
+          fi
+          echo "vllm_version=${VLLM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "model_name=${MODEL_NAME}" >> "$GITHUB_OUTPUT"
+          echo "image=index.docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VLLM_VERSION=${{ steps.params.outputs.vllm_version }}
+            MODEL_NAME=${{ steps.params.outputs.model_name }}
+          tags: |
+            ${{ steps.params.outputs.image }}:${{ steps.params.outputs.image_tag }}
+            ${{ steps.params.outputs.image }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| image | \`${{ steps.params.outputs.image }}:${{ steps.params.outputs.image_tag }}\` |"
+            echo "| vLLM base | \`${{ steps.params.outputs.vllm_version }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

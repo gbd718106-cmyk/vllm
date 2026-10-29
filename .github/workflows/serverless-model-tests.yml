@@ -1,0 +1,166 @@
+name: Serverless Model Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - "main"
+
+permissions:
+  contents: read
+
+# Only one run per ref at a time — these tests spin up real H100 endpoints.
+concurrency:
+  group: serverless-model-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # On PRs we only smoke-test one (small, cheap) model to keep review loops fast.
+  test-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: [blacksmith-8vcpu-ubuntu-2204, linux]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: Dockerfile
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install script dependencies
+        run: pip install pyyaml
+
+      - name: Run serverless e2e test
+        id: e2e_test
+        run: python scripts/serverless_e2e_test.py --config configs/gpt-oss/gpt_oss_120b.yaml --build
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY_2 }}
+          DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'runpod' }}
+          DOCKERHUB_IMG: ${{ vars.DOCKERHUB_IMG || 'worker-v1-vllm' }}
+          HUGGINGFACE_ACCESS_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN_2 }}
+
+      - name: Cleanup safety net
+        if: always()
+        run: |
+          if [ -n "${{ steps.e2e_test.outputs.endpoint_id }}" ]; then
+            curl -sf -X DELETE "https://rest.runpod.io/v1/endpoints/${{ steps.e2e_test.outputs.endpoint_id }}" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY_2 }}" || true
+          fi
+          if [ -n "${{ steps.e2e_test.outputs.template_id }}" ]; then
+            curl -sf -X DELETE "https://rest.runpod.io/v1/templates/${{ steps.e2e_test.outputs.template_id }}" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY_2 }}" || true
+          fi
+
+  # On push to main we test every tuned model config in parallel.
+  discover:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      configs: ${{ steps.list.outputs.configs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: List model configs
+        id: list
+        run: |
+          CONFIGS=$(find configs -name '*.yaml' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "configs=$CONFIGS" >> "$GITHUB_OUTPUT"
+
+  # The image is the same regardless of which model config is under test (configs
+  # only supply endpoint env vars), so build/push it once and let every matrix job
+  # in test-main reuse that same tag instead of rebuilding per config.
+  build:
+    if: github.event_name == 'push'
+    runs-on: [blacksmith-8vcpu-ubuntu-2204, linux]
+    outputs:
+      release_version: ${{ steps.build.outputs.release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: Dockerfile
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        env:
+          DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'runpod' }}
+          DOCKERHUB_IMG: ${{ vars.DOCKERHUB_IMG || 'worker-v1-vllm' }}
+          RELEASE_VERSION: test-${{ github.sha }}
+          HUGGINGFACE_ACCESS_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN }}
+        run: |
+          docker buildx bake --push
+          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+  test-main:
+    needs: [discover, build]
+    if: github.event_name == 'push' && needs.discover.result == 'success' && needs.build.result == 'success'
+    runs-on: [blacksmith-8vcpu-ubuntu-2204, linux]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON(needs.discover.outputs.configs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install script dependencies
+        run: pip install pyyaml
+
+      - name: Run serverless e2e test
+        id: e2e_test
+        run: python scripts/serverless_e2e_test.py --config "${{ matrix.config }}" --image "${DOCKERHUB_REPO}/${DOCKERHUB_IMG}:${RELEASE_VERSION}"
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY_2 }}
+          HUGGINGFACE_ACCESS_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN_2 }}
+          DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'runpod' }}
+          DOCKERHUB_IMG: ${{ vars.DOCKERHUB_IMG || 'worker-v1-vllm' }}
+          RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+
+      - name: Cleanup safety net
+        if: always()
+        run: |
+          if [ -n "${{ steps.e2e_test.outputs.endpoint_id }}" ]; then
+            curl -sf -X DELETE "https://rest.runpod.io/v1/endpoints/${{ steps.e2e_test.outputs.endpoint_id }}" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY_2 }}" || true
+          fi
+          if [ -n "${{ steps.e2e_test.outputs.template_id }}" ]; then
+            curl -sf -X DELETE "https://rest.runpod.io/v1/templates/${{ steps.e2e_test.outputs.template_id }}" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY_2 }}" || true
+          fi

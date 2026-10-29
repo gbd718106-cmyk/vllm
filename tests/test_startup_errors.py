@@ -1,0 +1,232 @@
+"""Which vLLM startup failures are worth answering, and which are worth a restart."""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+import startup_errors  # noqa: E402
+from startup_errors import classify  # noqa: E402
+
+TORCH_OOM = """
+(EngineCore_DP0 pid=245) ERROR 08-19 04:02:11 [core.py:1346] EngineCore failed to start.
+(EngineCore_DP0 pid=245) ERROR 08-19 04:02:11 [core.py:1346] torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 108.00 MiB.
+GPU 0 has a total capacity of 19.57 GiB of which 105.81 MiB is free.
+"""
+NO_KV_MEMORY = (
+    "ValueError: No available memory for the cache blocks. Try increasing "
+    "`gpu_memory_utilization` when initializing the engine."
+)
+KV_TOO_SMALL = (
+    "ValueError: To serve at least one request with the model's max seq len (131072), "
+    "(16.00 GiB KV cache is needed, which is larger than the available KV cache memory "
+    "(4.21 GiB). Based on the available memory, the estimated maximum model length is 34480. "
+    "Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine."
+)
+KV_TOO_SMALL_OLD = (
+    "ValueError: The model's max seq len (131072) is larger than the maximum number of "
+    "tokens that can be stored in KV cache (34480)."
+)
+MAX_LEN_EXCEEDS_MODEL = (
+    "ValueError: User-specified max_model_len (65536) is greater than the derived "
+    "max_model_len (max_position_embeddings=32768 or model_max_length=None in model's config.json)."
+)
+BAD_ARGS = "vllm serve: error: unrecognized arguments: --foo-bar 3"
+BAD_VALUE = "vllm serve: error: argument --max-model-len: invalid int value: 'lots'"
+GATED = (
+    "huggingface_hub.errors.GatedRepoError: 401 Client Error. Cannot access gated repo "
+    "for url https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/resolve/main/config.json."
+)
+NOT_FOUND = (
+    "huggingface_hub.errors.RepositoryNotFoundError: 404 Client Error. Repository Not Found "
+    "for url https://huggingface.co/org/nope/resolve/main/config.json."
+)
+UNSUPPORTED = "ValueError: Model architectures ['FooForCausalLM'] are not supported for now."
+# vLLM v0.30 worker log for IFM/K2-Horizon-7B without TRUST_REMOTE_CODE (the worker crash-looped on it).
+NEEDS_REMOTE_CODE = (
+    "pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig\n"
+    "  Value error, The repository IFM/K2-Horizon-7B contains custom code which must be executed to "
+    "correctly load the model. You can inspect the repository content at https://hf.co/IFM/K2-Horizon-7B .\n"
+    "Please pass the argument `trust_remote_code=True` to allow custom code to be run. [type=value_error]"
+)
+NO_SPACE = "OSError: [Errno 28] No space left on device"
+
+
+class TestOutOfMemory:
+    def test_torch_oom_names_the_model_and_the_card(self):
+        message = classify(TORCH_OOM, model="Qwen/Qwen3-30B-A3B")
+
+        assert message.startswith("Qwen/Qwen3-30B-A3B ran out of GPU memory")
+        assert "19.57 GiB" in message
+
+    def test_advice_covers_the_knobs_the_worker_exposes(self):
+        message = classify(TORCH_OOM)
+
+        for knob in ("MAX_MODEL_LEN", "ENFORCE_EAGER", "GPU_MEMORY_UTILIZATION", "TENSOR_PARALLEL_SIZE"):
+            assert knob in message
+
+    def test_no_kv_cache_memory_is_out_of_memory(self):
+        assert "ran out of GPU memory" in classify(NO_KV_MEMORY)
+
+    def test_kv_cache_too_small_passes_on_the_estimated_context(self):
+        message = classify(KV_TOO_SMALL)
+
+        assert "ran out of GPU memory" in message
+        assert "34480 tokens" in message
+
+    def test_older_kv_cache_wording_is_recognised(self):
+        assert classify(KV_TOO_SMALL_OLD) is not None
+
+    def test_oom_wins_over_surrounding_noise(self):
+        assert "GPU memory" in classify(f"Connection reset by peer\n{TORCH_OOM}\nEngineCore died")
+
+
+class TestConfiguration:
+    def test_max_model_len_above_the_model_limit_names_the_value(self):
+        message = classify(MAX_LEN_EXCEEDS_MODEL, model="org/model")
+
+        assert "MAX_MODEL_LEN=65536" in message
+        assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in message
+
+    @pytest.mark.parametrize("output", [BAD_ARGS, BAD_VALUE])
+    def test_argparse_rejections_quote_the_reason(self, output):
+        message = classify(output)
+
+        assert message.startswith("vLLM rejected its command line")
+        assert output.split("error: ", 1)[1] in message
+        assert "VLLM_EXTRA_ARGS" in message
+
+
+class TestModelAccess:
+    def test_gated_repo_points_at_hf_token(self):
+        assert "HF_TOKEN" in classify(GATED, model="meta-llama/Llama-3.1-8B-Instruct")
+
+    def test_missing_repo_points_at_model_name(self):
+        assert "MODEL_NAME" in classify(NOT_FOUND)
+
+    def test_unsupported_architecture(self):
+        assert "architecture" in classify(UNSUPPORTED)
+
+    def test_custom_code_points_at_trust_remote_code(self):
+        message = classify(NEEDS_REMOTE_CODE, model="IFM/K2-Horizon-7B")
+
+        assert message.startswith("IFM/K2-Horizon-7B ships its own modeling code")
+        assert "TRUST_REMOTE_CODE=true" in message
+
+    def test_custom_code_wins_over_unsupported_architecture(self):
+        # With remote code allowed, vLLM's Transformers backend can serve an
+        # architecture it has no native class for, so don't say "unsupported".
+        assert "TRUST_REMOTE_CODE=true" in classify(UNSUPPORTED + "\n" + NEEDS_REMOTE_CODE)
+
+
+def test_out_of_disk_points_at_container_disk():
+    assert "container disk" in classify(NO_SPACE)
+
+
+def test_out_of_disk_names_the_volume_caches():
+    # With a network volume, the HF cache and vLLM's compile cache live on it.
+    assert "vllm-cache" in classify(NO_SPACE)
+    assert "network volume" in classify(NO_SPACE)
+
+
+@pytest.mark.parametrize("output", [NO_SPACE, "OSError: [Errno 122] Disk quota exceeded"])
+def test_out_of_disk_predicate_covers_quota(output):
+    assert startup_errors.out_of_disk(output)
+
+
+def test_falls_back_to_a_generic_subject():
+    assert classify(NO_SPACE).startswith("The model")
+
+
+class TestUnknownFailures:
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "",
+            "Connection reset by peer while downloading",
+            "RuntimeError: something nobody has seen before",
+            "vLLM serve exited during startup with code 1",
+            # Only vLLM's own argparse errors count, not any line with "error:".
+            "INFO 08-19 [launcher.py] error: none",
+        ],
+    )
+    def test_are_left_for_the_platform_to_retry(self, output):
+        # Answering these forever would turn a flaky download into a dead
+        # endpoint; a restart is the right response.
+        assert classify(output) is None
+
+
+REVISION_NOT_FOUND = (
+    "huggingface_hub.errors.RevisionNotFoundError: 404 Client Error. Revision Not Found "
+    "for url https://huggingface.co/org/model/resolve/abc123def/config.json. "
+    "Invalid rev id: abc123def"
+)
+
+
+class TestRevisionNotFound:
+    def test_names_the_fix_and_the_force_push_cause(self):
+        message = classify(REVISION_NOT_FOUND, model="org/model")
+
+        assert message.startswith("The Hugging Face revision requested for org/model")
+        assert "MODEL_REVISION" in message
+        assert "force-pushed" in message
+
+    def test_wins_over_the_generic_404_match(self):
+        # The transport error underneath a missing revision is also a
+        # "404 Client Error", which the repository-not-found pattern matches.
+        # A vanished revision must not be reported as a missing repository.
+        message = classify(REVISION_NOT_FOUND, model="org/model")
+
+        assert "was not found on Hugging Face" not in message
+
+    def test_predicate_drives_the_relaunch(self):
+        from startup_errors import revision_not_found
+
+        assert revision_not_found(REVISION_NOT_FOUND)
+        assert not revision_not_found(NOT_FOUND)
+        assert not revision_not_found(TORCH_OOM)
+
+
+class TestOomAdviceForV029:
+    def test_mentions_the_batched_tokens_and_fp8_kv_knobs(self):
+        message = classify(TORCH_OOM)
+
+        assert "MAX_NUM_BATCHED_TOKENS=8192" in message
+        assert "KV_CACHE_DTYPE" in message
+        assert "FlashInfer" in message
+
+
+class TestOomAfterAutoRetry:
+    def test_says_the_reduced_footprint_relaunch_already_ran(self):
+        message = classify(TORCH_OOM, model="org/model", oom_retried=True)
+
+        assert message.startswith("org/model ran out of GPU memory")
+        assert "already retried once" in message
+        assert "ENFORCE_EAGER" in message
+        # The knobs the retry applied are no longer offered as the fix.
+        assert "MAX_NUM_BATCHED_TOKENS=8192 (the default doubled" not in message
+        # The fixes that remain are real capacity changes.
+        assert "TENSOR_PARALLEL_SIZE" in message
+        assert "quantized" in message
+
+    def test_still_carries_the_card_and_the_kV_estimate(self):
+        assert "19.57 GiB" in classify(TORCH_OOM, oom_retried=True)
+        assert "34480 tokens" in classify(KV_TOO_SMALL, oom_retried=True)
+
+
+class TestMemoryShortfallPredicate:
+    def test_all_three_memory_wording_forms_match(self):
+        from startup_errors import memory_shortfall
+
+        assert memory_shortfall(TORCH_OOM)
+        assert memory_shortfall(NO_KV_MEMORY)
+        assert memory_shortfall(KV_TOO_SMALL)
+
+    def test_non_memory_failures_do_not_match(self):
+        from startup_errors import memory_shortfall
+
+        assert not memory_shortfall(REVISION_NOT_FOUND)
+        assert not memory_shortfall(GATED)
+        assert not memory_shortfall("Connection reset by peer while downloading")

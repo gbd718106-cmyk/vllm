@@ -66,15 +66,36 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Resolve build parameters
         id: params
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
+          set -euo pipefail
+
+          # A Docker image reference may only contain lowercase [a-z0-9._-].
+          # Copy-pasting into the secret field often leaves stray whitespace or
+          # an uppercase handle, which makes buildx fail with
+          # "invalid reference format". Normalize before we build the name.
+          RAW_USER="$DH_USER"
+          DOCKERHUB_USER="$(printf '%s' "$RAW_USER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+
+          if [ -z "$DOCKERHUB_USER" ]; then
+            echo "::error::DOCKERHUB_USERNAME secret is empty or only whitespace. Set it to your Docker Hub username (hub.docker.com > Account settings > General), not your email."
+            exit 1
+          fi
+          if [[ "$DOCKERHUB_USER" == *"@"* ]]; then
+            echo "::error::DOCKERHUB_USERNAME looks like an email address. Use your Docker Hub username instead."
+            exit 1
+          fi
+          if [[ ! "$DOCKERHUB_USER" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::DOCKERHUB_USERNAME has characters that are not allowed in an image name: $DOCKERHUB_USER"
+            exit 1
+          fi
+          if [ "$RAW_USER" != "$DOCKERHUB_USER" ]; then
+            echo "::warning::DOCKERHUB_USERNAME was normalized to $DOCKERHUB_USER (whitespace removed / lowercased)."
+          fi
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             VLLM_VERSION="${{ inputs.vllm_version }}"
             IMAGE_TAG="${{ inputs.image_tag }}"
@@ -84,10 +105,27 @@ jobs:
             IMAGE_TAG="latest"
             MODEL_NAME=""
           fi
+
+          # Tags have the same lowercase-only rule as names.
+          IMAGE_TAG="$(printf '%s' "$IMAGE_TAG" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          if [[ ! "$IMAGE_TAG" =~ ^[a-z0-9_][a-z0-9._-]{0,127}$ ]]; then
+            echo "::error::Invalid Docker tag: '$IMAGE_TAG' (allowed: lowercase letters, digits, '.', '_', '-'; max 128 chars)."
+            exit 1
+          fi
+
+          IMAGE="$DOCKERHUB_USER/${{ env.IMAGE_NAME }}"
+          echo "dockerhub_username=$DOCKERHUB_USER" >> "$GITHUB_OUTPUT"
           echo "vllm_version=${VLLM_VERSION}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "model_name=${MODEL_NAME}" >> "$GITHUB_OUTPUT"
-          echo "image=index.docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Resolved image: $IMAGE:$IMAGE_TAG (vLLM base: $VLLM_VERSION)"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ steps.params.outputs.dockerhub_username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -99,6 +137,8 @@ jobs:
           build-args: |
             VLLM_VERSION=${{ steps.params.outputs.vllm_version }}
             MODEL_NAME=${{ steps.params.outputs.model_name }}
+          # Both tags are built from the already-lowercased, validated values
+          # produced by "Resolve build parameters".
           tags: |
             ${{ steps.params.outputs.image }}:${{ steps.params.outputs.image_tag }}
             ${{ steps.params.outputs.image }}:sha-${{ github.sha }}
